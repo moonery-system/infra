@@ -1,0 +1,83 @@
+version: '3.9'
+
+services:
+  laravel:
+    build:
+      context: ./api
+    container_name: moonery-laravel
+    volumes:
+      - ./api:/var/www
+    networks:
+      - moonery-network
+    depends_on:
+      - postgres
+    ports:
+      - "9000:9000"
+
+  nginx:
+    build:
+      context: ./api/.docker/nginx
+    container_name: moonery-nginx
+    volumes:
+      - ./api:/var/www
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - laravel
+    networks:
+      - moonery-network
+
+  postgres:
+    image: postgres:15
+    container_name: moonery-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-root}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-root}
+      POSTGRES_DB: ${POSTGRES_DB:-moonery}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+        - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - moonery-network
+
+  adminer:
+    image: adminer
+    container_name: moonery-adminer
+    ports:
+      - "8081:8080"
+    networks:
+      - moonery-network
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: moonery-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - moonery-network
+
+  hyperf:
+    build:
+      context: ./websocket-api
+    container_name: moonery-hyperf
+    working_dir: /data/project
+    volumes:
+      - ./websocket-api:/data/project
+    ports:
+      - "9501:9501"
+    tty: true
+    stdin_open: true
+    privileged: true
+    user: root
+    networks:
+      - moonery-network
+
+volumes:
+  postgres-data:
+
+networks:
+  moonery-network:
+    driver: bridge

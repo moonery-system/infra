@@ -1,0 +1,4 @@
+api/
+websocket-api/
+
+.env
