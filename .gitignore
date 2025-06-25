@@ -1,4 +1,5 @@
 api/
 websocket-api/
+frontend/
 
 .env
