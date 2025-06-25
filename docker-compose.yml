@@ -75,6 +75,7 @@ services:
     networks:
       - api-network
       - rabbitmq-network
+      - db-network
 
 volumes:
   postgres-data:
