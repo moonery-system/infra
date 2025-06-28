@@ -68,6 +68,7 @@ services:
       - ./websocket-api:/data/project
     ports:
       - "9501:9501"
+      - "9502:9502"
     tty: true
     stdin_open: true
     privileged: true
