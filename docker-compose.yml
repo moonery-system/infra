@@ -92,6 +92,8 @@ services:
       context: ./websocket-api
     container_name: moonery-hyperf
     working_dir: /data/project
+    command: php bin/hyperf.php start
+    restart: unless-stopped
     volumes:
       - ./websocket-api:/data/project
     ports:
@@ -99,6 +101,9 @@ services:
       - "9502:9502"
     tty: true
     stdin_open: true
+    depends_on:
+      - postgres
+      - rabbitmq
     privileged: true
     user: root
     networks:
