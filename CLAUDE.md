@@ -1,7 +1,7 @@
 # CLAUDE.md — Moonery System
 
 Guia de contexto para trabalhar neste repositório.
-Última atualização: 26/09/2026, após a fase 3 (fluxo de entrega).
+Última atualização: 27/09/2026, após a fase 5 (WebSocket real).
 
 ---
 
@@ -94,7 +94,8 @@ na mesma mensagem separadas por `;`. Granularidade: mediana ~3 arquivos.
 | Admin de banco | Adminer | `moonery-adminer` | 8081 |
 | Mensageria | RabbitMQ 3-management | `moonery-rabbitmq` | 5672, 15672 |
 | E-mail de dev | Mailpit | `moonery-mailpit` | 1025 (SMTP), 8025 (UI) |
-| WebSocket / consumers | Hyperf 3.1 / Swoole (PHP 8.3) | `moonery-hyperf` | 9501, 9502 |
+| Consumidor de e-mail | Laravel (`customs:consume-emails`) | `moonery-email-consumer` | — |
+| WebSocket / consumers | Hyperf 3.1 / Swoole (PHP 8.3) | `moonery-hyperf` | 9501 (http), 9502 (ws) |
 | Frontend | Vue 3 + TS + Tailwind (vue-cli) | **não containerizado** | 8082 |
 
 Redes isoladas: `db-network`, `rabbitmq-network`, `api-network`.
@@ -115,11 +116,13 @@ docker compose exec laravel php artisan key:generate
 docker compose exec laravel php artisan jwt:secret
 docker compose exec laravel php artisan customs:refresh-db    # wipe + migrate + seed
 
-# consumidor de e-mail — NÃO sobe sozinho, precisa ficar rodando
-docker compose exec laravel php artisan customs:consume-emails
+# o consumidor de e-mail sobe com a stack (serviço email-consumer, restart
+# unless-stopped) -- ele reinicia sozinho se o broker ainda não estava pronto
 
 # Hyperf (consumer AMQP de websocket)
 docker compose exec hyperf composer install
+# o hyperf sobe sozinho (command + restart no compose); isto é só para rodar
+# em primeiro plano e ver o log
 docker compose exec hyperf php bin/hyperf.php start
 
 cd frontend && npm install && npm run serve
@@ -151,6 +154,7 @@ users ──┬── user_roles ──── roles ──── role_permission
         ├── logs
         └── deliveries (creator_id, delivery_man_id, client_id, client_address_id)
                  ├── delivery_items
+                 ├── delivery_status_history
                  └── delivery_status
 ```
 
@@ -163,6 +167,9 @@ users ──┬── user_roles ──── roles ──── role_permission
   `ClientAddressService` recusa apagar endereço com entrega vinculada.
 - `deliveries.tracking_code` é gerado na criação (`MNY-<ano>-<6 chars>`), único.
 - `deliveries.delivered_at` é gravado ao entrar em `delivered`.
+- **`delivery_status_history`** guarda um passo por mudança de estado, com o ator e
+  `created_at`. Linhas são imutáveis (`const UPDATED_AT = null`). É a fonte da linha
+  do tempo — `logs` não serve para isso (ver seção 6).
 - `deliveries.scheduled_to` **nunca é preenchido** — agendamento não foi decidido.
 - `client_addresses.is_primary` está comentado na migration.
 - `logs.context` é `json`; `logs.user_id` é **NOT NULL** (ver `LogService`).
@@ -232,6 +239,13 @@ GET|POST  /api/users     GET|PUT|DELETE /api/users/{id}
 GET|POST  /api/clients   GET|PUT|DELETE /api/clients/{id}
 POST      /api/clients/{id}/addresses
 
+GET    /api/users?role=Delivery Man      lista filtrada por role (tela de atribuição)
+
+# notificações -- recurso próprio do usuário, SEM can:, escopo vem do auth()->id()
+GET    /api/notifications                paginado, com read_at por linha
+GET    /api/notifications/unread-count
+PUT    /api/notifications/{id}/read      idempotente; 404 se não for sua
+
 GET    /api/deliveries                   can:deliveries.viewAny  paginado + busca
 POST   /api/deliveries                   can:deliveries.create
 GET    /api/deliveries/{id}              can:deliveries.view
@@ -242,6 +256,11 @@ DELETE /api/deliveries/{id}/attach       can:deliveries.attach   entregador desi
 PUT    /api/deliveries/{id}/deliveryman  can:deliveries.assign   admin (re)atribui
 DELETE /api/deliveries/{id}              can:deliveries.delete
 ```
+
+`GET /api/deliveries/{id}` devolve, junto da entrega, `status_history` (a linha do
+tempo) e **`available_transitions`**: a lista de movimentos que *este* usuário pode
+fazer *agora*. A tela renderiza um botão por item e **não** conhece as regras — sem
+isso o frontend viraria uma segunda cópia da máquina de estados.
 
 `GET /api/clients` e `GET /api/deliveries` têm paginação e busca
 (`?search=&per_page=&page=`) e respondem no formato `ApiResponse::paginated`.
@@ -287,6 +306,14 @@ entregadores não pegarem a mesma entrega. `find()` seguido de `save()` perderia
 corrida. A reatribuição pelo admin também não passa pela tabela: é troca de
 responsável, não de estado (mas atribuir uma `pending` move para `attached`).
 
+**Histórico de estado.** `DeliveryService::recordStatusHistory()` é chamado nos
+**cinco** pontos que mexem em estado: `createDelivery`, `transitionTo`,
+`attachDelivery`, `detachDelivery` e `assignDeliveryman` (só quando de fato move).
+**Não tente trocar isso por um observer do Eloquent:** `attach` e `detach` mudam o
+status com `update()` no query builder, que não dispara eventos de model — o observer
+perderia exatamente essas duas transições. Por isso `logs` também não serve como
+linha do tempo: lá o attach grava `delivery_assigned`, não `delivery_status_update`.
+
 **Escopo de visibilidade**, decidido por permissão no service (o repositório só
 recebe a consulta a fazer):
 
@@ -301,18 +328,53 @@ um 403 confirmaria que ela existe.
 
 ## 7. Arquitetura do websocket-api (Hyperf)
 
-Papel pretendido, lendo o mesmo Postgres da API:
+Dois papéis, lendo o mesmo Postgres da API: **push de notificação** (funcionando) e
+**chat com o Suporte** (fase 6, sem uma linha escrita).
 
-1. **Push de notificação** — status do pacote em tempo real.
-2. **Chat com o Suporte** — ainda sem uma linha escrita.
+Sobe sozinho com a stack (`command: php bin/hyperf.php start`, `restart: unless-stopped`),
+servindo HTTP na 9501 e **WebSocket na 9502**.
 
-Implementado: `App\Amqp\Consumer\WebsocketNotificationConsumer` (consumer anotado) e
-`App\Service\WebSocketService::sendToUser()`, que **só faz `print_r`**. Models
-`Notification` e `User` sobre as tabelas da API.
+- `App\Controller\WebSocketController` — `onOpen`/`onMessage`/`onClose`.
+- `App\Service\JwtVerifier` — valida HS256 com `firebase/php-jwt` e
+  `config('jwt.secret')`, que **tem de ser o mesmo `JWT_SECRET` do `api/.env`**. Se
+  dessincronizar, toda conexão é recusada em silêncio — é o primeiro lugar a olhar.
+- `App\Service\ConnectionRegistry` — mapa de conexões numa `Swoole\Table`.
+- `App\Listener\CreateConnectionTableListener` — aloca a tabela no
+  `BeforeMainServerStart`, no master.
+- `App\Service\WebSocketService` — empurra via `Hyperf\WebSocketServer\Sender`.
+- `App\Amqp\Consumer\WebsocketNotificationConsumer` — consumer anotado, inalterado.
 
-**Não implementado:** nenhum servidor WebSocket em `config/autoload/server.php` (só
-HTTP na 9501), `hyperf/websocket-server` está no composer sem uso, sem handshake,
-sem autenticação de conexão, sem mapa `user_id → fd`.
+**O mapa é indexado por `fd`, não por `user_id`.** Uma `Swoole\Table` tem colunas
+fixas, então uma lista variável de fds por usuário não caberia; invertendo a chave,
+cada aba é uma linha, "várias conexões por usuário" sai de graça e a limpeza no
+`onClose` é um `del($fd)`. O push percorre a tabela filtrando por `user_id`.
+
+**A tabela é alocada antes do fork** dos workers. Alocada depois, cada processo fica
+com memória própria: o worker do WS grava o fd e o consumidor AMQP vê a tabela vazia.
+Limite aceito: é memória de **um processo** — com mais de um nó, isso vira Redis.
+
+**O push usa `Sender`, não o servidor cru.** O consumidor AMQP roda num processo
+separado dos workers, e o `Sender` encaminha para o processo dono do fd.
+
+**O handshake recusa no `onOpen`, não no 101.** O `onHandShake` padrão do Hyperf
+aceita a conexão antes de o controller rodar; recusar no upgrade exigiria handshake
+próprio. O token vem no cookie httpOnly — **cookie ignora porta**, então o que a API
+gravou em `localhost` chega em `ws://localhost:9502` sem nada na query string.
+
+### Três armadilhas deste serviço
+
+**`SCAN_CACHEABLE=(true)` no Dockerfile.** O scan de anotações vem de
+`runtime/container/scan.cache`. **Classe anotada nova não é vista** até você rodar
+`rm -rf runtime/container` e reiniciar — o sintoma é um listener ou consumer que
+simplesmente nunca dispara, sem erro nenhum.
+
+**Os contratos do Hyperf têm parâmetros sem tipo:**
+`OnMessageInterface::onMessage($server, $frame)`. Tipar (`Frame $frame`) quebra a
+compatibilidade e mata o worker com fatal **no meio do handshake**, em loop.
+
+**O `LoggerFactory` escreve em `runtime/logs/hyperf.log`, não no stdout.**
+`docker compose logs hyperf` não mostra nada do que a aplicação registra — leia o
+arquivo.
 
 ### Contrato de mensageria
 
@@ -333,7 +395,8 @@ token, que não deve ir para a coluna `description` de `notifications`.
 **Dois cuidados operacionais:** quem declara a fila é o consumidor, então **se ele
 nunca rodou a fila não existe** e o exchange topic descarta a mensagem em silêncio —
 convite criado com o consumidor parado se perde (resgate: `POST /invite` reenvia).
-E o serviço `rabbitmq` **não tem volume** no compose: recriar o container apaga tudo.
+O serviço `rabbitmq` tem volume nomeado (`rabbitmq-data`), então fila e mensagens
+sobrevivem a recriar o container.
 
 `RabbitMQPublisher` e `RabbitMQConsumer` conectam **sob demanda**, não no construtor.
 Isso é deliberado: o Laravel instancia todos os comandos registrados para montar o
@@ -359,11 +422,34 @@ de pé (quebraria `migrate` em CI). Não reverta isso.
 - `vue.config.js` tem `historyApiFallback: true` — sem isso todo deep link (inclusive
   o do e-mail de convite) dá 404 no dev server.
 
-Telas: Login, **Invite** (definição de senha), Home (placeholder), Clients (lista com
-busca e paginação, criar, detalhe, editar, criar endereço), NotFound, Unauthorized.
+- `src/components/deliveries/` — `DeliveryStatusBadge` (selo com cor por estado; as
+  classes Tailwind estão escritas por extenso de propósito, porque strings montadas em
+  runtime seriam removidas na purga), `DeliveryTimeline`, `DeliveryCard`,
+  `DeliveryStatusActions` (renderiza um botão por `available_transitions`),
+  `ClientPicker`, `DeliveryItemsForm`.
+- `src/utils/status.ts` — `humanizeStatus("client_address_not_found")`.
+- `formatDateTime` (`src/utils/date.ts`) aceita `string | Date | null`, porque a API
+  devolve string.
+- `PaginationItems` tem prop `itemLabel` (default `"items"`).
+- `src/services/websocket.ts` — cliente singleton, com reconexão em backoff
+  exponencial até 30s. `connect()` no `NavBar` quando a sessão é confirmada,
+  `disconnect()` no logout, e `onNotification(handler)` devolve a função de
+  cancelamento. O cookie viaja sozinho; nada de token em query string.
+- `NotificationToast.vue` e `NotificationBell.vue` — toast do push e contador de não
+  lidas no `NavBar`. A tela de detalhe da entrega chama `loadDelivery()` ao receber
+  push: o payload é genérico (título e descrição), então recarregar mantém um caminho
+  de dados só.
 
-**Não existe tela de entregas, usuários, notificações ou logs.** O `NavBar` tem links
-para `/about` e `/users` sem rota registrada.
+Telas: Login, **Invite** (definição de senha), Home (placeholder), Clients (lista com
+busca e paginação, criar, detalhe, editar, criar endereço), **Deliveries** (lista com
+abas Disponíveis/Minhas para quem tem `deliveries.attach`, criar, detalhe com linha do
+tempo e ações), NotFound, Unauthorized.
+
+**Não existe tela de usuários, notificações ou logs.** O `NavBar` tem links para
+`/about` e `/users` sem rota registrada.
+
+O peso do item é `decimal(10,2)` e chega como **string** — converta com `Number()`
+antes de somar, senão o total sai concatenado.
 
 ---
 
@@ -372,16 +458,18 @@ para `/about` e `/users` sem rota registrada.
 | Área | Status |
 |---|---|
 | Infra Docker (Postgres, Nginx, RabbitMQ, Mailpit, Laravel, Hyperf) | ✅ |
-| Modelo de dados (16 migrations + seeders) | ✅ |
+| Modelo de dados (18 migrations + seeders) | ✅ |
 | RBAC (roles/permissions + Gate) | ✅ estrutura; ❌ role `Support` |
 | Auth JWT por cookie httpOnly | ✅ |
 | Onboarding por convite (e-mail → senha → ativação) | ✅ ponta a ponta |
 | CRUD de usuários | ✅ backend, ❌ frontend |
 | CRUD de clientes + endereços | ✅ |
 | Entrega: criação com endereço e itens | ✅ |
-| Entrega: máquina de estados, atribuição híbrida, escopo, paginação | ✅ backend, ❌ frontend |
-| Notificação por e-mail | ✅ (consumidor precisa estar rodando) |
-| Notificação por WebSocket | 🟡 consumer só faz `print_r` |
+| Entrega: máquina de estados, atribuição híbrida, escopo, paginação | ✅ |
+| Entrega: telas (lista, criação, detalhe com linha do tempo e ações) | ✅ |
+| Notificação por e-mail | ✅ (consumidor sobe com a stack) |
+| Notificação por WebSocket | ✅ push ao vivo, várias conexões por usuário |
+| Notificações in-app (lista, não lidas, marcar como lida) | ✅ |
 | Chat com o Suporte | ❌ nada |
 | Log de auditoria | ✅ escrita; ❌ nenhuma leitura |
 | Testes automatizados | ❌ só exemplos default |
@@ -403,34 +491,23 @@ uma fonte de verdade, reusando o pipeline existente.
 dos poderes decididos. E o vocabulário de status **não acomoda** cancelamento pelo
 Suporte: só há `canceled_by_client` e `canceled_by_admin`, falta `canceled_by_support`.
 
-**C. Servidor WebSocket.** Nenhum ws server configurado. Precisa de handshake
-validando o JWT do cookie (cookie ignora porta, então ele chega em `ws://localhost:9502`
-de graça) e de `Swoole\Table` para o mapa `user_id → fd` — array em memória daria
-mapa parcial, porque `worker_num = swoole_cpu_num()`.
-
-**D. Frontend de entregas.** Nenhuma tela, apesar de o backend estar completo.
-
 ### Menores
 
 1. `GET /users` sem paginação nem busca.
-2. Sem endpoint para o usuário listar as próprias notificações, nem "lida/não lida"
-   (`NotificationRepository::findById` existe; falta rota e conceito de leitura).
-3. Rotas de endereço: só `POST` registrada. `destroy` existe no controller sem rota;
+2. Rotas de endereço: só `POST` registrada. `destroy` existe no controller sem rota;
    `update` é um TODO.
-4. Sem reset de senha para usuário já ativo (`password_resets` existe sem uso), sem
+3. Sem reset de senha para usuário já ativo (`password_resets` existe sem uso), sem
    refresh de JWT, sem blacklist explícita.
-5. `deliveries.scheduled_to` sem uso — agendamento não decidido.
-6. `changePassword` grava senha e convite **sem transação**; erro no meio deixa
+4. `deliveries.scheduled_to` sem uso — agendamento não decidido.
+5. `changePassword` grava senha e convite **sem transação**; erro no meio deixa
    estado parcial.
-7. `rabbitmq` sem volume no compose.
-8. Consumidor de e-mail não sobe sozinho (falta serviço no compose ou supervisor).
-9. `ExampleTest` **falha**: afirma `GET /` == 200 contra o `abort(404)` deliberado de
+6. `ExampleTest` **falha**: afirma `GET /` == 200 contra o `abort(404)` deliberado de
    `routes/web.php`. É deletar o teste.
-10. Frontend fora do `docker-compose.yml`.
-11. `DeliveryItemsRequest::authorize()` retorna `false` (classe não usada).
-12. `AuthController::login()` monta o cookie antes de checar se o attempt falhou
+7. Frontend fora do `docker-compose.yml`.
+8. `DeliveryItemsRequest::authorize()` retorna `false` (classe não usada).
+9. `AuthController::login()` monta o cookie antes de checar se o attempt falhou
     (inofensivo, mas invertido).
-13. `DatabaseSeeder` cria 1000 clientes fake por padrão.
+10. `DatabaseSeeder` cria 1000 clientes fake por padrão.
 
 ---
 
