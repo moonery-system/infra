@@ -57,7 +57,25 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
     networks:
+      - rabbitmq-network
+
+  email-consumer:
+    build:
+      context: ./api
+    container_name: moonery-email-consumer
+    command: php artisan customs:consume-emails
+    restart: unless-stopped
+    volumes:
+      - ./api:/var/www
+    depends_on:
+      - postgres
+      - rabbitmq
+    networks:
+      - api-network
+      - db-network
       - rabbitmq-network
 
   mailpit:
@@ -90,6 +108,7 @@ services:
 
 volumes:
   postgres-data:
+  rabbitmq-data:
 
 networks:
   db-network:
