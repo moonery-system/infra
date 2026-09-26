@@ -1,7 +1,7 @@
 # CLAUDE.md — Moonery System
 
 Guia de contexto para trabalhar neste repositório.
-Última atualização: 27/09/2026, após a fase 5 (WebSocket real).
+Última atualização: 27/09/2026, após a fase 7 (arredondamento).
 
 ---
 
@@ -96,7 +96,7 @@ na mesma mensagem separadas por `;`. Granularidade: mediana ~3 arquivos.
 | E-mail de dev | Mailpit | `moonery-mailpit` | 1025 (SMTP), 8025 (UI) |
 | Consumidor de e-mail | Laravel (`customs:consume-emails`) | `moonery-email-consumer` | — |
 | WebSocket / consumers | Hyperf 3.1 / Swoole (PHP 8.3) | `moonery-hyperf` | 9501 (http), 9502 (ws) |
-| Frontend | Vue 3 + TS + Tailwind (vue-cli) | **não containerizado** | 8082 |
+| Frontend | Vue 3 + TS + Tailwind (vue-cli) | `moonery-frontend` | 8082 |
 
 Redes isoladas: `db-network`, `rabbitmq-network`, `api-network`.
 
@@ -129,8 +129,21 @@ cd frontend && npm install && npm run serve
 ```
 
 `customs:refresh-db` (`app/Console/Commands/WipeMigrateSeed.php`) faz
-`db:wipe` + `migrate` + `db:seed`. O `DatabaseSeeder` cria também **1000 clientes
-fake** — útil para paginação, pesado para uso diário.
+`db:wipe` + `migrate` + `db:seed`, e leva ~2s. Os **1000 clientes fake** saíram para
+um seeder próprio, não chamado por padrão:
+`php artisan db:seed --class=ClientsDemoSeeder`.
+
+### Testes
+
+```bash
+docker compose exec postgres createdb -U root moonery_test   # uma vez
+docker compose exec laravel php artisan test
+```
+
+O `phpunit.xml` aponta para **`moonery_test`**. Não aponte para o banco de
+desenvolvimento: `RefreshDatabase` apagaria seus dados. sqlite ficou de fora de
+propósito — o `LIKE` do Postgres é case-sensitive e o do sqlite não, então um teste de
+busca passaria aqui e falharia de verdade.
 
 E-mails de dev aparecem no Mailpit em `http://localhost:8025`.
 
@@ -164,7 +177,9 @@ users ──┬── user_roles ──── roles ──── role_permission
 - `users` e `deliveries` usam `softDeletes`.
 - **`deliveries.client_address_id`** é obrigatório, FK com **`restrictOnDelete`**:
   entrega é registro histórico, apagar endereço não pode apagar entrega.
-  `ClientAddressService` recusa apagar endereço com entrega vinculada.
+  `ClientAddressService` **recusa apagar e editar** endereço com entrega vinculada,
+  respondendo 409 — editar reescreveria o destino de uma entrega passada. Nesse caso o
+  cliente cadastra um endereço novo.
 - `deliveries.tracking_code` é gerado na criação (`MNY-<ano>-<6 chars>`), único.
 - `deliveries.delivered_at` é gravado ao entrar em `delivered`.
 - **`delivery_status_history`** guarda um passo por mudança de estado, com o ator e
@@ -173,6 +188,9 @@ users ──┬── user_roles ──── roles ──── role_permission
 - `deliveries.scheduled_to` **nunca é preenchido** — agendamento não foi decidido.
 - `client_addresses.is_primary` está comentado na migration.
 - `logs.context` é `json`; `logs.user_id` é **NOT NULL** (ver `LogService`).
+- **Não existe tabela de reset de senha.** O reset usa a tabela `invites`, que já tem
+  token, validade e marca de uso — `password_resets` foi apagada por ser um mecanismo
+  paralelo que nunca foi usado.
 
 ---
 
@@ -229,15 +247,19 @@ Route (routes/api.php, middleware can:*)
 POST   /api/auth/login
 GET    /api/invite?token=          valida token de convite
 POST   /api/invite                 gera/reenvia convite por e-mail
-POST   /api/changePassword?token=  define senha e ativa a conta
+POST   /api/changePassword?token=  define senha (ativa a conta, ou apenas troca)
+POST   /api/auth/forgot-password   pede o link de reset
 
 # autenticadas (auth:api), cada uma com can:<permissão>
 GET    /api/auth/user              devolve { user, permissions }
+POST   /api/auth/refresh           token novo; o antigo vai para a blacklist
 POST   /api/auth/logout
 
-GET|POST  /api/users     GET|PUT|DELETE /api/users/{id}
-GET|POST  /api/clients   GET|PUT|DELETE /api/clients/{id}
-POST      /api/clients/{id}/addresses
+GET|POST   /api/users    GET|PUT|DELETE /api/users/{id}   (index paginado, ?search, ?role)
+GET        /api/roles    lookup do formulário de usuário
+GET|POST   /api/clients  GET|PUT|DELETE /api/clients/{id}
+POST       /api/clients/{id}/addresses
+PUT|DELETE /api/clients/{id}/addresses/{addressId}
 
 GET    /api/users?role=Delivery Man      lista filtrada por role (tela de atribuição)
 
@@ -265,6 +287,25 @@ isso o frontend viraria uma segunda cópia da máquina de estados.
 `GET /api/clients` e `GET /api/deliveries` têm paginação e busca
 (`?search=&per_page=&page=`) e respondem no formato `ApiResponse::paginated`.
 A busca de entrega casa `tracking_code` e nome do cliente.
+
+### Testes
+
+`tests/Feature/DeliveryTransitionTest.php` (máquina de estados) e
+`DeliveryAuthorizationTest.php` (escopo de visibilidade) são o que a suíte cobre — é
+onde um revisor tenta quebrar. Ampliar cobertura não é o objetivo.
+
+Convenções, todas em `tests/TestCase.php`:
+
+- `seedDomain()` semeia permissões, roles e status. **Não** use `DatabaseSeeder`.
+- `admin()`, `client()`, `deliveryman()` criam usuário com a role.
+- `fakeBroker()` troca o `RabbitMQPublisher` por um falso. Chame no `setUp` de qualquer
+  coisa que mexa em entrega: o domínio publica notificação, e esperar timeout de
+  conexão AMQP em cada troca de status deixa a suíte rastejando.
+- `actingAsUser($user)` usa `actingAs($user, 'api')`, **não** um JWT de verdade. Com
+  token real, a segunda requisição dentro do mesmo teste continua autenticada como o
+  usuário anterior — o jwt-auth guarda o token parseado no singleton, e nem
+  `forgetGuards()` nem `unsetToken()` resolvem. O sintoma é cruel: a suíte fica verde
+  afirmando o comportamento do usuário errado.
 
 ### Fluxo de entrega: três camadas ortogonais
 
@@ -398,6 +439,11 @@ convite criado com o consumidor parado se perde (resgate: `POST /invite` reenvia
 O serviço `rabbitmq` tem volume nomeado (`rabbitmq-data`), então fila e mensagens
 sobrevivem a recriar o container.
 
+**Routing key nova exige reiniciar o consumidor.** Os bindings são declarados quando
+o consumidor sobe, então acrescentar uma chave no código não a cria no broker até
+`docker compose restart email-consumer`. Até lá a mensagem é publicada e descartada em
+silêncio.
+
 `RabbitMQPublisher` e `RabbitMQConsumer` conectam **sob demanda**, não no construtor.
 Isso é deliberado: o Laravel instancia todos os comandos registrados para montar o
 console, então conexão no construtor faria **qualquer `artisan`** exigir o RabbitMQ
@@ -431,6 +477,15 @@ de pé (quebraria `migrate` em CI). Não reverta isso.
 - `formatDateTime` (`src/utils/date.ts`) aceita `string | Date | null`, porque a API
   devolve string.
 - `PaginationItems` tem prop `itemLabel` (default `"items"`).
+- `src/services/api.ts` — além de normalizar o erro, tenta **um** refresh ao receber
+  401 e repete a requisição. `/auth/refresh`, `/auth/user` e `/auth/login` estão numa
+  lista de exclusão: o guard de rota chama `/auth/user` em toda navegação, e deixar o
+  401 dele disparar refresh que chama `/auth/user` travaria a aplicação.
+- `src/services/auth.ts` — `getUserData()` deduplica a **requisição em voo**, não só o
+  resultado. Sem isso cada `PermissionGuard` que monta junto dispara seu próprio
+  `/auth/user` (eram 3 por carregamento de página).
+- `src/views/users/` e `src/components/users/UserForm.vue` — CRUD de usuários, com o
+  select de role alimentado por `GET /roles`.
 - `src/services/websocket.ts` — cliente singleton, com reconexão em backoff
   exponencial até 30s. `connect()` no `NavBar` quando a sessão é confirmada,
   `disconnect()` no logout, e `onNotification(handler)` devolve a função de
@@ -472,8 +527,10 @@ antes de somar, senão o total sai concatenado.
 | Notificações in-app (lista, não lidas, marcar como lida) | ✅ |
 | Chat com o Suporte | ❌ nada |
 | Log de auditoria | ✅ escrita; ❌ nenhuma leitura |
-| Testes automatizados | ❌ só exemplos default |
-| CI/CD | ❌ |
+| Testes automatizados | ✅ 20 testes de feature (máquina de estados, autorização) |
+| CI | ✅ `api` (suíte + lint), `websocket-api` (phpstan nível 0) |
+| Reset de senha e refresh de JWT | ✅ |
+| Telas de usuários | ✅ |
 
 ---
 
@@ -493,21 +550,17 @@ Suporte: só há `canceled_by_client` e `canceled_by_admin`, falta `canceled_by_
 
 ### Menores
 
-1. `GET /users` sem paginação nem busca.
-2. Rotas de endereço: só `POST` registrada. `destroy` existe no controller sem rota;
-   `update` é um TODO.
-3. Sem reset de senha para usuário já ativo (`password_resets` existe sem uso), sem
-   refresh de JWT, sem blacklist explícita.
-4. `deliveries.scheduled_to` sem uso — agendamento não decidido.
-5. `changePassword` grava senha e convite **sem transação**; erro no meio deixa
-   estado parcial.
-6. `ExampleTest` **falha**: afirma `GET /` == 200 contra o `abort(404)` deliberado de
-   `routes/web.php`. É deletar o teste.
-7. Frontend fora do `docker-compose.yml`.
-8. `DeliveryItemsRequest::authorize()` retorna `false` (classe não usada).
-9. `AuthController::login()` monta o cookie antes de checar se o attempt falhou
-    (inofensivo, mas invertido).
-10. `DatabaseSeeder` cria 1000 clientes fake por padrão.
+1. `deliveries.scheduled_to` sem uso — agendamento nunca foi decidido.
+2. `tailwind.config.js` fora do padrão do prettier (2 erros de lint pré-existentes,
+   commitados em `af4c837`).
+3. `websocket-api` tem 21 advisories de segurança em 6 pacotes, todos transitivos do
+   skeleton do Hyperf e presos pelas constraints dele (`composer audit`).
+4. phpstan no nível 0. Subir exige `hyperf/phpstan-extension`: as 9 ocorrências acima
+   de 0 são magia de framework (relações Eloquent, `BASE_PATH`, um tipo do Swow que
+   nem está instalado), e silenciá-las com ignores faria a ferramenta mentir.
+5. Nenhum teste no frontend nem no `websocket-api`.
+6. `attach` numa entrega já tomada responde 404 (o escopo filtra antes do validador).
+   A tela trata como "não disponível"; virar 409 exigiria buscar fora do escopo.
 
 ---
 
@@ -528,3 +581,7 @@ Suporte: só há `canceled_by_client` e `canceled_by_admin`, falta `canceled_by_
 - Ao mudar o contrato de mensagem publicada, atualize publisher (Laravel) e consumer
   (Hyperf) juntos.
 - Confira o repo Git correto antes de commitar (a raiz ignora as três pastas).
+- Teste novo herda de `Tests\TestCase` e usa `seedDomain()` + `fakeBroker()` no
+  `setUp`, e `actingAsUser()` para trocar de identidade.
+- Erro de regra de negócio é `BusinessException` (vira 409 pelo `Handler`), não
+  `return false`. `return false` fica para "não encontrei", que vira 404.
