@@ -590,6 +590,51 @@ Isso é deliberado: o Laravel instancia todos os comandos registrados para monta
 console, então conexão no construtor faria **qualquer `artisan`** exigir o RabbitMQ
 de pé (quebraria `migrate` em CI). Não reverta isso.
 
+### Retry e dead-letter (fase 9)
+
+`emails.queue` e `assistant.queue` têm escada de retry (`App\Messaging\RetryPolicy`,
+`RabbitMQConsumer::declareRetryLadder()`): 3 patamares (5s/30s/5min, `config/messaging.php`,
+env `MESSAGING_RETRY_TIER_*_MS`) e uma DLQ (`<fila>.dlq`) por fila principal.
+
+**As 4 filas existentes nunca mudam de argumento** — o retry é decidido e **publicado pela
+aplicação**, não por `x-dead-letter-exchange` na fila principal, então não há risco de
+`PRECONDITION_FAILED` ao redeclarar. Só entram filas novas: `<fila>.retry.1/2/3`
+(`x-message-ttl` fixo — nunca por mensagem, que tem o problema conhecido do RabbitMQ de só
+checar TTL na cabeça da fila — mais `x-dead-letter-exchange=''` e
+`x-dead-letter-routing-key=<fila principal>`, que devolve pela **exchange padrão**, sem
+bind nenhum) e `<fila>.dlq`.
+
+**A routing key original vira header, não sobrevive ao bounce sozinha.** Uma mensagem que
+volta da fila de retry chega com routing key = **nome da fila principal** (exchange padrão
+entrega por nome de fila, não por tópico) — `dispatch()` prefere o header
+`x-original-routing-key` quando presente. Contagem de tentativas é um header nosso
+(`x-retry-attempt`), não `x-death`: o retry é publicado pela aplicação, então `x-death` nem
+apareceria do jeito certo, e somar entradas de filas diferentes é chato de acertar.
+
+**Classificação:** `PermanentFailureException` (payload que não é JSON, routing key
+desconhecida) vai direto para a DLQ, sem gastar patamar. Entrega/notificação/mensagem que
+não existe mais continua um no-op silencioso (decisão deliberada — não é bug, é escopo).
+`assistant.queue` reaproveita a mesma política: quase tudo já é absorvido dentro do
+`AssistantRunner` (fallback interno), então a DLQ ali é rede de segurança para falha de
+infraestrutura *antes* do `claim()`, não conserto de bug observado.
+
+**Idempotência do e-mail:** `invites.email_sent_at` (separada de `used_at`, que é "o
+convidado clicou o link") e `user_notifications.emailed_at` (por destinatário — o laço de
+`sendNotification()` pula quem já tem a marca e só reenvia para quem falhou).
+
+**Hyperf não tem escada de retry, só DLQ + log.** Não existe falha transitória plausível em
+"empurrar para um WebSocket" (destinatário offline não chega a este ponto —
+`Result::DROP` de registro-não-encontrado continua igual); uma exceção genuína agora
+publica em `<fila>.dlq` (via `App\Amqp\DeadLetterPublisher`, canal cru — **não** usa o
+`Producer` do Hyperf, que sempre tenta declarar a exchange do alvo, e a exchange sem nome é
+reservada pelo RabbitMQ) e continua devolvendo `Result::DROP` como hoje.
+
+**Operação:** `customs:dlq:list {queue} [--limit=]`, `customs:dlq:replay {queue}
+[--limit=|--all]`, `customs:dlq:check {queue}` (sai com código 1 se houver mensagem — para
+cron), `{queue}` = `emails`/`assistant`. Painel do RabbitMQ em `:15672` mostra a
+profundidade de qualquer fila em Queues. Detalhes, bugs achados e como foram corrigidos:
+`api/docs/messaging-decision-log.md`.
+
 ---
 
 ## 8. Arquitetura do frontend (Vue 3)
@@ -628,8 +673,10 @@ de pé (quebraria `migrate` em CI). Não reverta isso.
 - `src/components/chat/` — `ChatWidget` (botão flutuante à esquerda, para não bater no
   toast à direita), `MessageList` e `MessageComposer`. O widget é "minha conversa" para
   todo usuário autenticado, inclusive o Admin.
-- **Assistente no chat** (a UI segue **em inglês**, como o resto do app; só o corpo das
-  mensagens do bot vem em português do backend). A lógica mora em composables **sem HTTP e sem
+- **Assistente no chat** (a UI segue **em inglês**, como o resto do app; o corpo das mensagens
+  do bot também — respostas livres seguem o idioma do cliente, `resources/prompts/assistant.md`,
+  padrão inglês; as seis mensagens fixas, `config/assistant.php`, viraram inglês em 27/09/2026,
+  ver `api/docs/assistant-decision-log.md`). A lógica mora em composables **sem HTTP e sem
   DOM** (recebem as chamadas por parâmetro), e os componentes são finos:
   - `useAssistantConfirmation` — máquina de estados do cartão (`pending`, `submitting`,
     `confirmed`, `rejected`, `expired`, `refused`, `network_error`, `closed`). 409/403/404
@@ -723,7 +770,8 @@ antes de somar, senão o total sai concatenado.
 | Papel `Support` e `canceled_by_support` | ✅ |
 | Log de auditoria | ✅ escrita; ❌ nenhuma leitura |
 | Assistente de IA no chat | ✅ backend e frontend, verificados ponta a ponta com Gemini em dev (só dados de seed) |
-| Testes automatizados | ✅ 135 testes de feature no backend; ✅ 96 testes unitários no frontend (composables e utils); ❌ nenhum teste de componente `.vue` |
+| Retry e dead-letter na mensageria | ✅ `emails.queue`/`assistant.queue` (escada + DLQ); Hyperf só DLQ + log; verificado contra o broker real |
+| Testes automatizados | ✅ 161 testes de feature no backend; ✅ 96 testes unitários no frontend (composables e utils); ❌ nenhum teste de componente `.vue`; ❌ nenhum no `websocket-api` |
 | CI | ✅ `api` (suíte + lint + phpstan), `websocket-api` (phpstan) |
 | Análise estática | ✅ os dois backends limpos no **nível 5** |
 | Reset de senha e refresh de JWT | ✅ |
@@ -753,9 +801,9 @@ mão no navegador, e o build não checa tipos de `.vue` (ver seção 8).
    `npm install` podou 13 entradas órfãs do lockfile (`pinia` e afins, que nada usa).
 8. `sender` no JSON de mensagem é o usuário inteiro, **com e-mail**: cliente recebe o e-mail
    dos atendentes. Vale um ticket; não mexi.
-9. O corpo das mensagens fixas do bot é sempre em português (config), mesmo com a UI em
-   inglês e o cliente escrevendo em inglês. As respostas livres do modelo **deveriam** seguir o
-   idioma do cliente (o prompt manda), mas isso não foi testado.
+9. `php artisan test` (sem `--testsuite`) falha com `Test directory "tests/Unit" not found`:
+   a suíte nunca existiu neste repositório, mas o `phpunit.xml` ainda a declara. Rodar com
+   `--testsuite=Feature` até alguém decidir criar a pasta ou tirar a suíte do `phpunit.xml`.
 
 ---
 
