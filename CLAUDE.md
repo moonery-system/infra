@@ -128,6 +128,7 @@ docker compose exec hyperf composer install
 docker compose exec hyperf php bin/hyperf.php start
 
 cd frontend && npm install && npm run serve
+cd frontend && npm run test:unit      # Jest: só a lógica em TypeScript puro (ver seção 8)
 ```
 
 `customs:refresh-db` (`app/Console/Commands/WipeMigrateSeed.php`) faz
@@ -427,10 +428,13 @@ POST /api/assistant/actions/{id}/confirm|reject   → DeliveryService::cancelDel
   `config()->set('assistant.enabled', true)`. Duas lições: `Http::fake()` **empilha** stubs
   (o primeiro que casa ganha — recrie a factory entre respostas) e teste de endpoint
   sequencial **esconde** condição atômica de update: teste o repositório direto.
-- **Frontend: não feito.** Contrato disponível: `assistant_status` na conversa; `pending_action`
-  (`id`, `status`, `expires_at`) nas mensagens de pergunta de confirmação; endpoints
-  `confirm`/`reject`. O push WS de `chat.message` **não** leva `pending_action`, então a tela
-  deve rebuscar `/conversations/me` ao recebê-lo.
+- **Frontend: feito** (seção 8). Contrato que ele consome: `assistant_status`/`handoff_reason`
+  na conversa; `is_assistant` (flag do model `Message`, via `AssistantBot`, uma query por
+  requisição) e `pending_action` (`id`, `status`, `expires_at`, `delivery_id`) nas mensagens;
+  endpoints `confirm`/`reject`. O push WS de `chat.message` **não** leva nada disso (e o
+  `sender` dele é uma string, o do REST é um objeto), então a tela **rebusca** a conversa ao
+  recebê-lo, em vez de anexar o payload. `pending_action.error` e a mensagem do 409 são texto
+  técnico e nunca são exibidos.
 
 ### Fluxo de entrega: três camadas ortogonais
 
@@ -624,9 +628,43 @@ de pé (quebraria `migrate` em CI). Não reverta isso.
 - `src/components/chat/` — `ChatWidget` (botão flutuante à esquerda, para não bater no
   toast à direita), `MessageList` e `MessageComposer`. O widget é "minha conversa" para
   todo usuário autenticado, inclusive o Admin.
+- **Assistente no chat** (a UI segue **em inglês**, como o resto do app; só o corpo das
+  mensagens do bot vem em português do backend). A lógica mora em composables **sem HTTP e sem
+  DOM** (recebem as chamadas por parâmetro), e os componentes são finos:
+  - `useAssistantConfirmation` — máquina de estados do cartão (`pending`, `submitting`,
+    `confirmed`, `rejected`, `expired`, `refused`, `network_error`, `closed`). 409/403/404
+    são recusa; sem status, 5xx e 401 são erro de rede (com "Try again", que repete a
+    **mesma** intenção). Expira por timer, limitado a 2³¹−1 ms. O servidor tem a última
+    palavra **só quando traz novidade**: um reload que ainda diz `pending` não apaga o erro
+    de rede nem a expiração. O motivo da recusa **não** é interpretado da mensagem do 409:
+    `AssistantActionCard` busca `GET /deliveries/{id}` e diz o status atual (e cai no texto
+    genérico se a entrega voltou a ser cancelável, para não afirmar algo falso).
+  - `useAssistantWaiting` — fase `idle | waiting | timed_out` do "The assistant is
+    replying…". É **derivada de dados** (última mensagem é minha + `assistant_status=active` +
+    elegível), não de evento; limite de **45 s**; conta o tempo pelo `created_at` da mensagem.
+    Elegível = `assistant.use` **e não** `chat.viewAll` (`canUseAssistant`), a mesma regra do
+    backend — sem isso entregador e Admin esperariam para sempre. Enquanto espera, o widget
+    recarrega a cada 5 s (até 2 min): rede de segurança contra push perdido.
+  - `utils/singleFlight.ts` — refetch coalescida (rajada de pushes vira **uma** repetição).
+    `utils/handoff.ts` — rótulos do motivo do encaminhamento para o Suporte.
+  - `AssistantActionCard` (cliente: botões; Suporte: **só leitura**), `AssistantPresence`
+    (região `aria-live` com indicador, aviso de demora e faixa de encaminhamento),
+    `HandoffBadge`. `MessageList` tem `interactive` (widget sim, caixa de entrada não) e rola
+    até a última mensagem **ao montar** — a pergunta de confirmação é a última.
+  - Classes de tom do selo ficam escritas por extenso (purga do Tailwind).
 - `src/views/support/SupportInboxView.vue` — "conversas que eu atendo", em `/support`
   atrás de `chat.viewAll`. Para o Admin, que é requerente **e** atendente, os dois
-  coexistem e a rotulagem é o que evita confusão.
+  coexistem e a rotulagem é o que evita confusão. Mostra o selo de encaminhamento na lista e
+  na thread e atualiza sozinha pelo push.
+- **Testes do frontend:** Jest 27 + ts-jest, `testEnvironment: node`, em `tests/unit/`, **sem**
+  plugin do vue-cli e sem `@vue/test-utils` — só a lógica em `.ts` é testada (composables e
+  utils; 96 testes). Componentes `.vue` **não** têm teste. Cuidados: `tsconfig.types` inclui
+  `jest`; sem `@types/node` (use `globalThis`/`setTimeout`, não `global`/`setImmediate`);
+  `jest.useFakeTimers("modern")` para expiração e prazo. O plano de teste manual, com dados de
+  seed, está em `frontend/docs/assistant-manual-test.md`.
+- **O build e o lint não checam tipos dos `.vue`** (um erro de tipo proposital passou no
+  `npm run build`). O `vue-tsc` não rodou aqui (conflito de versões com o TS 4.5). Verifiquei
+  os `<script setup>` extraindo-os para `.ts` e rodando o `tsc` do projeto; não checa templates.
 - `src/views/users/` e `src/components/users/UserForm.vue` — CRUD de usuários, com o
   select de role alimentado por `GET /roles`.
 - `src/services/websocket.ts` — cliente singleton, com reconexão em backoff
@@ -684,8 +722,8 @@ antes de somar, senão o total sai concatenado.
 | Chat com o Suporte | ✅ tempo real, caixa de entrada, não lidas |
 | Papel `Support` e `canceled_by_support` | ✅ |
 | Log de auditoria | ✅ escrita; ❌ nenhuma leitura |
-| Assistente de IA no chat | ✅ backend, verificado ponta a ponta com Gemini em dev; ❌ frontend |
-| Testes automatizados | ✅ 131 testes de feature (entrega, autorização, chat, assistente); ❌ nada no frontend |
+| Assistente de IA no chat | ✅ backend e frontend, verificados ponta a ponta com Gemini em dev (só dados de seed) |
+| Testes automatizados | ✅ 135 testes de feature no backend; ✅ 96 testes unitários no frontend (composables e utils); ❌ nenhum teste de componente `.vue` |
 | CI | ✅ `api` (suíte + lint + phpstan), `websocket-api` (phpstan) |
 | Análise estática | ✅ os dois backends limpos no **nível 5** |
 | Reset de senha e refresh de JWT | ✅ |
@@ -697,19 +735,27 @@ antes de somar, senão o total sai concatenado.
 
 O escopo declarado está completo. O que resta são pontas, em ordem de retorno.
 
-**O maior furo é a ausência de teste no frontend.** Toda a UI foi verificada à mão no
-navegador, mas nada impede uma regressão silenciosa.
+**O maior furo é a falta de teste de componente no frontend.** A lógica do assistente tem
+teste unitário (composables e utils), mas os `.vue` e as telas em geral só foram verificados à
+mão no navegador, e o build não checa tipos de `.vue` (ver seção 8).
 
 1. `deliveries.scheduled_to` sem uso — agendamento nunca foi decidido.
-2. `tailwind.config.js` fora do padrão do prettier (2 erros de lint pré-existentes,
-   commitados em `af4c837`).
+2. ~~`tailwind.config.js` fora do padrão do prettier~~ — resolvido: `npm run lint` está com
+   0 erros (restam avisos `no-explicit-any` herdados).
 3. `websocket-api` tem 21 advisories de segurança em 6 pacotes, todos transitivos do
    skeleton do Hyperf e presos pelas constraints dele (`composer audit`).
 4. O phpstan está preso ao 1.12 porque o `larastan/larastan` 2.x o pina; o 3.x pede
    Laravel 11+. Subir de versão é um upgrade de framework, não de ferramenta.
-5. Nenhum teste no frontend nem no `websocket-api`.
+5. Nenhum teste no `websocket-api`, e nenhum de componente no frontend.
 6. `attach` numa entrega já tomada responde 404 (o escopo filtra antes do validador).
    A tela trata como "não disponível"; virar 409 exigiria buscar fora do escopo.
+7. O Jest 27 traz ~214 pacotes transitivos de desenvolvimento (não vão para o bundle) e o
+   `npm install` podou 13 entradas órfãs do lockfile (`pinia` e afins, que nada usa).
+8. `sender` no JSON de mensagem é o usuário inteiro, **com e-mail**: cliente recebe o e-mail
+   dos atendentes. Vale um ticket; não mexi.
+9. O corpo das mensagens fixas do bot é sempre em português (config), mesmo com a UI em
+   inglês e o cliente escrevendo em inglês. As respostas livres do modelo **deveriam** seguir o
+   idioma do cliente (o prompt manda), mas isso não foi testado.
 
 ---
 
