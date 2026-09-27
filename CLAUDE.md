@@ -95,6 +95,7 @@ na mesma mensagem separadas por `;`. Granularidade: mediana ~3 arquivos.
 | Mensageria | RabbitMQ 3-management | `moonery-rabbitmq` | 5672, 15672 |
 | E-mail de dev | Mailpit | `moonery-mailpit` | 1025 (SMTP), 8025 (UI) |
 | Consumidor de e-mail | Laravel (`customs:consume-emails`) | `moonery-email-consumer` | — |
+| Consumidor do assistente | Laravel (`customs:consume-assistant`) | `moonery-assistant-consumer` | — |
 | WebSocket / consumers | Hyperf 3.1 / Swoole (PHP 8.3) | `moonery-hyperf` | 9501 (http), 9502 (ws) |
 | Frontend | Vue 3 + TS + Tailwind (vue-cli) | `moonery-frontend` | 8082 |
 
@@ -307,6 +308,75 @@ Convenções, todas em `tests/TestCase.php`:
   `forgetGuards()` nem `unsetToken()` resolvem. O sintoma é cruel: a suíte fica verde
   afirmando o comportamento do usuário errado.
 
+### Assistente de IA no chat (fase 8)
+
+No chat com o Suporte, um **assistente** responde o cliente sobre as entregas dele, com
+ferramentas, e encaminha ao Suporte quando não sabe. Detalhes, problemas e correções, com
+data: `api/docs/assistant-decision-log.md`. Diagrama: `api/README.md`.
+
+```
+ConversationService::sendMessage
+  → AssistantDispatcher   cliente elegível? publica assistant.requests {message_id}
+                          humano do Suporte respondeu? conversa vira handed_off
+  → customs:consume-assistant (serviço assistant-consumer, 1 consumidor, prefetch 1)
+  → AssistantRunner       claim idempotente → laço ≤5 iterações → resposta do bot
+       LlmClient (GuardedLlmClient → GeminiLlmClient)   ToolRegistry → 5 ferramentas
+  → ConversationService::sendAsAssistant  → chat.messages (mesmo push, websocket-api intocado)
+POST /api/assistant/actions/{id}/confirm|reject   → DeliveryService::cancelDelivery
+```
+
+- **O bot é um usuário** (`assistant@moonery.local`, sem senha) com a role `Assistant`, que
+  **não tem nenhuma permissão** — em especial não `chat.viewAll`, que é o que o faria entrar do
+  lado do Suporte de toda conversa. Quem dispara o assistente é decidido por permissão:
+  remetente é o dono da conversa **e** tem `assistant.use` (Client e Admin) **e** não tem
+  `chat.viewAll`. Nunca por nome de role.
+- **Escopo por construção.** O usuário das ferramentas vem da conversa (`ToolContext`), nunca dos
+  argumentos do modelo. `ValidatedTool` entrega ao `handle()` só as chaves que as regras
+  declaram. Ferramenta nova: estenda `ValidatedTool`, alcance entrega **só** pelos métodos
+  `...ForClient` do `DeliveryInterface`, e devolva só o que o `DeliveryPresenter` permite
+  (sem entregador, sem e-mail/telefone, sem CEP/complemento, sem nome de quem mexeu).
+  Entrega alheia e inexistente devolvem o **mesmo** conteúdo. O `DeliveryService` **não** serve às
+  ferramentas: ele depende de `auth()`, que não existe no consumidor.
+- **Cancelar não é uma ferramenta.** `request_cancel_delivery` só cria uma linha em
+  `assistant_pending_actions` (com validade). Quem cancela é o endpoint de confirmação, pelo
+  mesmo `DeliveryService::cancelDelivery()` — o validador continua sendo a fonte da regra (a
+  consulta sem efeito colateral é `DeliveryTransitionValidator::checkTransition()`). Com uma
+  confirmação pendente, o texto da resposta é **fixo** (config), não o do modelo: ele não pode
+  dizer que cancelou o que só perguntou. "Sim" digitado no chat não cancela.
+- **Encaminhamento é permanente na v1.** `conversations.assistant_status` = `active` |
+  `handed_off` (+ `handoff_reason`); virar `handed_off` é update condicional. Vira quando o
+  modelo pede, quando qualquer falha/limite/teto acontece (mensagem fixa de fallback, sem erro
+  para o usuário) ou quando um humano do Suporte responde. Reativar é decisão de produto em aberto.
+- **Limites** (`config/assistant.php`): espaçamento entre chamadas, retry com backoff+jitter,
+  teto diário de chamadas e de tokens, limite por usuário, prazo total, 5 iterações. Tudo que é
+  "quantas vezes/quão rápido" mora em `GuardedLlmClient`, não no provedor. O dia do teto vira
+  em `America/Los_Angeles` (é onde a cota do Gemini zera). Contadores em
+  `assistant_usage_daily`, por upsert atômico — não em cache. Cada execução vira uma linha em
+  `assistant_runs` (`message_id` unique é o que dá a idempotência).
+- **Gemini** (`generateContent`, `Http::`, sem SDK): a chave só no cabeçalho `x-goog-api-key`.
+  As `parts` cruas do turno do modelo ficam em `LlmMessage::$providerState` e voltam
+  **intactas** (a `thoughtSignature` vem na própria parte `functionCall`; verificado com uma
+  sonda real em 27/09/2026). A doc do Google já promove a *Interactions API* e chama
+  `generateContent` de legado; migrar é reescrever só `GeminiLlmClient`.
+- **A fila só existe se o consumidor já rodou.** Mesma armadilha do e-mail: `assistant.requests`
+  publicada sem o serviço `assistant-consumer` de pé se perde em silêncio (o cliente fica sem
+  resposta, mas a mensagem está gravada). Latência real: ~6–11 s por resposta; não há indicador
+  de "digitando".
+- **Banco existente:** `php artisan migrate` e `db:seed --class=AssistantSeeder` (idempotente).
+  As tabelas `roles`/`permissions` **não têm timestamps**: use `insert()`, nunca `firstOrCreate`.
+- **Privacidade.** A camada gratuita do Gemini pode usar entradas/saídas para treino. Em dev,
+  **só dados de seed**.
+- **Testes** (`tests/Feature/Assistant*`, `GuardedLlmClientTest`, `GeminiLlmClientTest`,
+  `ConsumeAssistantQueueTest`): sem rede e sem chave (`FakeLlmClient`, `FakeClock`,
+  `Http::fake`). O `phpunit.xml` liga `ASSISTANT_ENABLED=false`; teste do assistente liga com
+  `config()->set('assistant.enabled', true)`. Duas lições: `Http::fake()` **empilha** stubs
+  (o primeiro que casa ganha — recrie a factory entre respostas) e teste de endpoint
+  sequencial **esconde** condição atômica de update: teste o repositório direto.
+- **Frontend: não feito.** Contrato disponível: `assistant_status` na conversa; `pending_action`
+  (`id`, `status`, `expires_at`) nas mensagens de pergunta de confirmação; endpoints
+  `confirm`/`reject`. O push WS de `chat.message` **não** leva `pending_action`, então a tela
+  deve rebuscar `/conversations/me` ao recebê-lo.
+
 ### Fluxo de entrega: três camadas ortogonais
 
 A máquina de estados é **por papel** sem nunca checar nome de papel, porque a
@@ -428,6 +498,7 @@ models próprios sobre as mesmas tabelas.
 | `invites.email` | `{invite_id}` | `emails.queue` | `customs:consume-emails` (Laravel) | funciona |
 | `notifications.email` | `{notification_id}` | `emails.queue` | `customs:consume-emails` | funciona |
 | `notifications.websocket` | `{notification_id}` | `notifications.queue.websocket` | Hyperf | consome e só imprime |
+| `assistant.requests` | `{message_id}` | `assistant.queue` | `customs:consume-assistant` (Laravel) | funciona |
 
 **Convite não é notificação.** Ele tem routing key própria porque o convidado não
 consegue logar ainda (não veria notificação in-app) e porque o e-mail precisa do
@@ -527,6 +598,7 @@ antes de somar, senão o total sai concatenado.
 | Notificações in-app (lista, não lidas, marcar como lida) | ✅ |
 | Chat com o Suporte | ❌ nada |
 | Log de auditoria | ✅ escrita; ❌ nenhuma leitura |
+| Assistente de IA no chat | ✅ backend, verificado ponta a ponta com Gemini em dev; ❌ frontend |
 | Testes automatizados | ✅ 20 testes de feature (máquina de estados, autorização) |
 | CI | ✅ `api` (suíte + lint), `websocket-api` (phpstan nível 0) |
 | Reset de senha e refresh de JWT | ✅ |
