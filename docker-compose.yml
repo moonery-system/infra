@@ -78,6 +78,22 @@ services:
       - db-network
       - rabbitmq-network
 
+  assistant-consumer:
+    build:
+      context: ./api
+    container_name: moonery-assistant-consumer
+    command: php artisan customs:consume-assistant
+    restart: unless-stopped
+    volumes:
+      - ./api:/var/www
+    depends_on:
+      - postgres
+      - rabbitmq
+    networks:
+      - api-network
+      - db-network
+      - rabbitmq-network
+
   frontend:
     image: node:20-alpine
     container_name: moonery-frontend
