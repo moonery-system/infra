@@ -98,6 +98,48 @@ These exist only in the development seed. Never reuse them anywhere real.
 4. **Ask the AI assistant.** As the client, ask *"Where is my delivery?"* (needs the optional key below; without it the assistant hands the chat to support).
 5. **See the plumbing.** Open RabbitMQ at http://localhost:15672 (`guest` / `guest`) to see the exchange and queues, and Mailpit at http://localhost:8025 for the invite e-mails.
 
+## Screenshots
+
+<table>
+<tr>
+<td width="50%">
+
+**Admin overview**
+<img src=".screenshots/admin_dashboard.png" alt="Admin dashboard listing two deliveries, one pending and one in transit">
+
+</td>
+<td width="50%">
+
+**Delivery details, as the delivery man** — one button per status the API actually allows next, and the full history below
+<img src=".screenshots/delivery_detail_as_deliveryman.png" alt="Delivery detail page in transit, with action buttons and a four-step status timeline">
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Asking the assistant "where is my delivery?"**
+<img src=".screenshots/support_chat_as_client.png" alt="Support chat where the assistant answers a status question with the real delivery data">
+
+</td>
+<td width="50%">
+
+**Asking it to cancel** — the assistant can only propose; only the customer's click confirms
+<img src=".screenshots/cancel_delivery_chat_support.png" alt="Support chat showing the assistant's fixed cancellation confirmation with Confirm and Keep buttons">
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**The support desk**, after the customer confirmed — the assistant closed the loop on its own
+<img src=".screenshots/support_desk_as_support.png" alt="Support inbox showing the full conversation, ending with the assistant confirming the cancellation">
+
+</td>
+<td width="50%"></td>
+</tr>
+</table>
+
 ## Optional: turn on the AI assistant
 
 In `api/.env`, set `ASSISTANT_ENABLED=true`, `ASSISTANT_PROVIDER=gemini`, an `ASSISTANT_MODEL` from Google AI Studio, and your `GEMINI_API_KEY`. The full list is in [`api/README.md`](https://github.com/moonery-system/api#readme).
