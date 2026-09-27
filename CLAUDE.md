@@ -1,7 +1,8 @@
 # CLAUDE.md — Moonery System
 
 Guia de contexto para trabalhar neste repositório.
-Última atualização: 27/09/2026, após a fase 7 (arredondamento).
+Última atualização: 27/09/2026, após a fase 6 (Suporte e chat). **O escopo
+declarado está fechado.**
 
 ---
 
@@ -14,7 +15,7 @@ Sistema de **gestão de entregas (deliveries)** com quatro atores:
 | **Admin** | Cadastra clientes, usuários e entregas; atribui entregador; cancela; acesso total |
 | **Client** | Destinatário da entrega; vê as suas e cancela antes da coleta |
 | **Delivery Man** | Entregador; pega entrega livre, avança o status, registra falha e devolução |
-| **Support** | Atende por chat; lê entregas e pode alterar status ou cancelar. **Não existe no código** — nem role, nem permissões, nem chat |
+| **Support** | Atende cliente, entregador e admin por chat; lê entregas e pode alterar status ou cancelar como suporte |
 
 ### Contexto do projeto
 
@@ -146,6 +147,22 @@ desenvolvimento: `RefreshDatabase` apagaria seus dados. sqlite ficou de fora de
 propósito — o `LIKE` do Postgres é case-sensitive e o do sqlite não, então um teste de
 busca passaria aqui e falharia de verdade.
 
+### Análise estática
+
+```bash
+docker compose exec laravel composer analyse     # api, larastan, nível 5
+docker compose exec hyperf composer analyse      # websocket-api, nível 5
+```
+
+Os dois estão em **zero erros no nível 5**, sem baseline e sem `ignoreErrors` largo. O
+CI reprova erro novo nos dois repos.
+
+**Não existe `hyperf/phpstan-extension`** — se você ler isso em algum lugar, está
+errado (eu mesmo afirmei antes de verificar). O que o Hyperf precisava era anotação de
+relação nos models, `query()->find()` em vez do `find()` estático, um `@param` próprio
+no `WebSocketController` (o contrato herda um tipo do Swow, engine que não usamos) e um
+`phpstan-bootstrap.php` definindo `BASE_PATH`.
+
 E-mails de dev aparecem no Mailpit em `http://localhost:8025`.
 
 ### Credenciais semeadas
@@ -155,6 +172,7 @@ E-mails de dev aparecem no Mailpit em `http://localhost:8025`.
 | admin@gmail.com | `admin` | Admin |
 | client@gmail.com | `client` | Client |
 | deliveryman@gmail.com | `deliveryman` | Delivery Man |
+| support@gmail.com | `support` | Support |
 
 ---
 
@@ -166,6 +184,7 @@ users ──┬── user_roles ──── roles ──── role_permission
         ├── invites
         ├── user_notifications ──── notifications
         ├── logs
+        ├── conversations ──── messages (sender_id, delivery_id nullable)
         └── deliveries (creator_id, delivery_man_id, client_id, client_address_id)
                  ├── delivery_items
                  ├── delivery_status_history
@@ -189,6 +208,12 @@ users ──┬── user_roles ──── roles ──── role_permission
 - `deliveries.scheduled_to` **nunca é preenchido** — agendamento não foi decidido.
 - `client_addresses.is_primary` está comentado na migration.
 - `logs.context` é `json`; `logs.user_id` é **NOT NULL** (ver `LogService`).
+- **`conversations`** tem `user_id` **unique**: um canal por pessoa, e é isso que faz
+  `GET /conversations/me` ser idempotente. O lado do Suporte não é armazenado —
+  qualquer atendente responde.
+- **`messages.delivery_id`** é nullable e fica **na mensagem, não na conversa**: com um
+  canal só por pessoa, o campo na conversa significaria "a última entrega comentada",
+  que é vago. Na mensagem é preciso. `read_at` também é por mensagem.
 - **Não existe tabela de reset de senha.** O reset usa a tabela `invites`, que já tem
   token, validade e marca de uso — `password_resets` foi apagada por ser um mecanismo
   paralelo que nunca foi usado.
@@ -236,10 +261,13 @@ Route (routes/api.php, middleware can:*)
 - **Autorização por permissão-string, nunca por role.** `AuthServiceProvider`
   registra `Gate::before` que delega para `User::hasPermission($ability)`.
 - Permissões semeadas: `{users,clients}.{create,update,delete,view,viewAny}` e
-  `deliveries.{create,update,delete,view,viewAny,viewAll,attach,assign,cancel,cancelAny}`.
+  `deliveries.{create,update,delete,view,viewAny,viewAll,attach,assign,cancel,cancelAny,cancelAsSupport}`
+  e `chat.viewAll`.
 - Por role: **Admin** todas · **Client** `clients.view`, `deliveries.view`,
   `deliveries.viewAny`, `deliveries.cancel` · **Delivery Man** `deliveries.view`,
-  `deliveries.viewAny`, `deliveries.update`, `deliveries.attach`.
+  `deliveries.viewAny`, `deliveries.update`, `deliveries.attach` · **Support**
+  `clients.view`, `deliveries.{view,viewAny,viewAll,update,cancelAsSupport}`,
+  `chat.viewAll` — atende e resolve, mas **não** edita cadastro.
 
 ### Endpoints
 
@@ -263,6 +291,14 @@ POST       /api/clients/{id}/addresses
 PUT|DELETE /api/clients/{id}/addresses/{addressId}
 
 GET    /api/users?role=Delivery Man      lista filtrada por role (tela de atribuição)
+
+# chat -- a própria conversa não exige permissão; a caixa de entrada sim
+GET  /api/conversations              caixa de entrada, can:chat.viewAll
+GET  /api/conversations/me           a própria conversa, criando se não existir
+GET  /api/conversations/{id}         404 fora do escopo
+POST /api/conversations/{id}/messages
+PUT  /api/conversations/{id}/read
+GET  /api/conversations/unread-count
 
 # notificações -- recurso próprio do usuário, SEM can:, escopo vem do auth()->id()
 GET    /api/notifications                paginado, com read_at por linha
@@ -307,6 +343,25 @@ Convenções, todas em `tests/TestCase.php`:
   usuário anterior — o jwt-auth guarda o token parseado no singleton, e nem
   `forgetGuards()` nem `unsetToken()` resolvem. O sintoma é cruel: a suíte fica verde
   afirmando o comportamento do usuário errado.
+
+### Chat
+
+Um canal por pessoa (`conversations.user_id` unique) e **qualquer atendente responde**:
+o lado do Suporte não é armazenado.
+
+**"Não lida" é decidido pela direção da mensagem, não por quem lê.** Como qualquer
+agente pode responder, "quem leu" não é chave útil: mensagem escrita pelo atendido está
+aguardando o Suporte (*inbound*), o contrário aguarda o atendido (*outbound*). Em
+`MessageRepository` isso é um `whereColumn` entre `messages.sender_id` e
+`conversations.user_id`. Ler um lado **não** limpa o outro.
+
+A **caixa de entrada é do atendente** (`can:chat.viewAll` na rota). O requerente não
+lista nada: ele tem uma conversa só, alcançada por `GET /conversations/me`, que faz
+find-or-create.
+
+Ao enviar, `ConversationService` resolve os destinatários — o dono da conversa mais
+quem tem `chat.viewAll`, menos o remetente — via
+`UserRepository::findByPermission()`, **por permissão e não por nome de role**.
 
 ### Assistente de IA no chat (fase 8)
 
@@ -407,7 +462,10 @@ in_transit               → delivered / client_address_not_found / client_not_f
 client_address_not_found → in_transit (nova tentativa) / return_to_sender
 client_not_found         → in_transit / return_to_sender
 
-delivered, canceled_by_client, canceled_by_admin, return_to_sender → TERMINAIS
+todo estado acima       → canceled_by_support (cancelAsSupport, ator qualquer)
+
+delivered, canceled_by_client, canceled_by_admin,
+canceled_by_support, return_to_sender → TERMINAIS
 ```
 
 `pending ↔ attached` **não está na tabela de propósito**: pegar e desistir passam
@@ -510,6 +568,14 @@ convite criado com o consumidor parado se perde (resgate: `POST /invite` reenvia
 O serviço `rabbitmq` tem volume nomeado (`rabbitmq-data`), então fila e mensagens
 sobrevivem a recriar o container.
 
+**Chat:** `ChatMessageConsumer` escuta `chat.messages` na fila
+`chat.queue.websocket` — **nunca ligada ao `emails.queue`**, senão cada mensagem de
+chat mandaria um e-mail. O payload é `{message_id, recipient_ids}`: o conteúdo é
+rebuscado (claim check), mas **quem** recebe vem pronto, porque depende de permissão e
+resolver isso aqui duplicaria a autorização num segundo serviço.
+`WebSocketService::sendToUserIds()` é o caminho único de push; o de notificação usa o
+mesmo.
+
 **Routing key nova exige reiniciar o consumidor.** Os bindings são declarados quando
 o consumidor sobe, então acrescentar uma chave no código não a cria no broker até
 `docker compose restart email-consumer`. Até lá a mensagem é publicada e descartada em
@@ -524,7 +590,7 @@ de pé (quebraria `migrate` em CI). Não reverta isso.
 
 ## 8. Arquitetura do frontend (Vue 3)
 
-- **Vue CLI** (não Vite), TypeScript, Tailwind. Mistura Options API (`NavBar`, views
+- **Vue CLI** (não Vite), TypeScript, Tailwind. Mistura Options API (`AppShell`, views
   de clients) e `<script setup>` (`AuthLogin`, `AuthInvite`).
 - `src/services/api.ts` — axios com `withCredentials: true`, `baseURL` de
   `VUE_APP_API_URL`. O interceptor **normaliza o erro** para
@@ -555,24 +621,43 @@ de pé (quebraria `migrate` em CI). Não reverta isso.
 - `src/services/auth.ts` — `getUserData()` deduplica a **requisição em voo**, não só o
   resultado. Sem isso cada `PermissionGuard` que monta junto dispara seu próprio
   `/auth/user` (eram 3 por carregamento de página).
+- `src/components/chat/` — `ChatWidget` (botão flutuante à esquerda, para não bater no
+  toast à direita), `MessageList` e `MessageComposer`. O widget é "minha conversa" para
+  todo usuário autenticado, inclusive o Admin.
+- `src/views/support/SupportInboxView.vue` — "conversas que eu atendo", em `/support`
+  atrás de `chat.viewAll`. Para o Admin, que é requerente **e** atendente, os dois
+  coexistem e a rotulagem é o que evita confusão.
 - `src/views/users/` e `src/components/users/UserForm.vue` — CRUD de usuários, com o
   select de role alimentado por `GET /roles`.
 - `src/services/websocket.ts` — cliente singleton, com reconexão em backoff
-  exponencial até 30s. `connect()` no `NavBar` quando a sessão é confirmada,
+  exponencial até 30s. `connect()` no `AppShell` quando a sessão é confirmada,
   `disconnect()` no logout, e `onNotification(handler)` devolve a função de
   cancelamento. O cookie viaja sozinho; nada de token em query string.
 - `NotificationToast.vue` e `NotificationBell.vue` — toast do push e contador de não
-  lidas no `NavBar`. A tela de detalhe da entrega chama `loadDelivery()` ao receber
+  lidas no `AppShell`. A tela de detalhe da entrega chama `loadDelivery()` ao receber
   push: o payload é genérico (título e descrição), então recarregar mantém um caminho
   de dados só.
 
-Telas: Login, **Invite** (definição de senha), Home (placeholder), Clients (lista com
+Telas: Login, **Invite** (definição de senha), Home (últimas entregas e atalhos por permissão), Clients (lista com
 busca e paginação, criar, detalhe, editar, criar endereço), **Deliveries** (lista com
 abas Disponíveis/Minhas para quem tem `deliveries.attach`, criar, detalhe com linha do
 tempo e ações), NotFound, Unauthorized.
 
-**Não existe tela de usuários, notificações ou logs.** O `NavBar` tem links para
-`/about` e `/users` sem rota registrada.
+- **Design system (overhaul visual).** Tema escuro único, tokens em
+  `tailwind.config.js`: `ink` (azul-noturno; **`ink-900` é exatamente o fundo do
+  `logo_moonery.png`**, por isso a logo não tem caixa visível na sidebar), `cream`
+  (off-white quente, nunca `#fff`), `ember` (laranja, primário), `gold` (dourado,
+  secundário), `rust`/`moss` (erro/sucesso). Fontes Sora (títulos) + Manrope.
+  Texto sobre `ember`/`gold` é `text-ink-950`, não branco (contraste).
+- `src/components/layout/` — `AppShell` (sidebar fixa em `lg+`, drawer no mobile),
+  `SidebarLink`, `PageHeader`. Views **não** trazem mais `min-h-screen`/`max-w-*
+  mx-auto`: quem dá o respiro é o shell. `src/components/ui/` — `AppIcon` (glifos
+  Lucide inline), `EmptyState`, `SearchInput`, `ListSkeleton`. **Sem emojis**; ícone só
+  via `AppIcon`. Ativos da marca em `src/assets/` e favicon em `public/`.
+- Vue CLI dev server: se aparecer overlay de erro de prettier que não bate com o
+  arquivo em disco, é cache do eslint — `rm -rf node_modules/.cache/eslint`.
+
+**Não existe tela de notificações (lista completa) ou logs.**
 
 O peso do item é `decimal(10,2)` e chega como **string** — converta com `Number()`
 antes de somar, senão o total sai concatenado.
@@ -584,11 +669,11 @@ antes de somar, senão o total sai concatenado.
 | Área | Status |
 |---|---|
 | Infra Docker (Postgres, Nginx, RabbitMQ, Mailpit, Laravel, Hyperf) | ✅ |
-| Modelo de dados (18 migrations + seeders) | ✅ |
-| RBAC (roles/permissions + Gate) | ✅ estrutura; ❌ role `Support` |
+| Modelo de dados (25 migrations + seeders) | ✅ |
+| RBAC (roles/permissions + Gate) | ✅ quatro roles |
 | Auth JWT por cookie httpOnly | ✅ |
 | Onboarding por convite (e-mail → senha → ativação) | ✅ ponta a ponta |
-| CRUD de usuários | ✅ backend, ❌ frontend |
+| CRUD de usuários | ✅ |
 | CRUD de clientes + endereços | ✅ |
 | Entrega: criação com endereço e itens | ✅ |
 | Entrega: máquina de estados, atribuição híbrida, escopo, paginação | ✅ |
@@ -596,11 +681,13 @@ antes de somar, senão o total sai concatenado.
 | Notificação por e-mail | ✅ (consumidor sobe com a stack) |
 | Notificação por WebSocket | ✅ push ao vivo, várias conexões por usuário |
 | Notificações in-app (lista, não lidas, marcar como lida) | ✅ |
-| Chat com o Suporte | ❌ nada |
+| Chat com o Suporte | ✅ tempo real, caixa de entrada, não lidas |
+| Papel `Support` e `canceled_by_support` | ✅ |
 | Log de auditoria | ✅ escrita; ❌ nenhuma leitura |
 | Assistente de IA no chat | ✅ backend, verificado ponta a ponta com Gemini em dev; ❌ frontend |
-| Testes automatizados | ✅ 20 testes de feature (máquina de estados, autorização) |
-| CI | ✅ `api` (suíte + lint), `websocket-api` (phpstan nível 0) |
+| Testes automatizados | ✅ 131 testes de feature (entrega, autorização, chat, assistente); ❌ nada no frontend |
+| CI | ✅ `api` (suíte + lint + phpstan), `websocket-api` (phpstan) |
+| Análise estática | ✅ os dois backends limpos no **nível 5** |
 | Reset de senha e refresh de JWT | ✅ |
 | Telas de usuários | ✅ |
 
@@ -608,28 +695,18 @@ antes de somar, senão o total sai concatenado.
 
 ## 10. Lacunas conhecidas
 
-### Grandes (áreas do escopo sem uma linha escrita)
+O escopo declarado está completo. O que resta são pontas, em ordem de retorno.
 
-**A. Chat com o Suporte.** Sem tabela de conversa nem mensagem, sem endpoint, sem
-tela. Desenho mínimo pelo escopo: conversa por usuário (`delivery_id` nullable),
-Suporte sempre numa ponta, mensagem com autor/corpo/marca de leitura. Caminho de
-escrita decidido: **Laravel persiste e publica na fila, Hyperf só faz fan-out** —
-uma fonte de verdade, reusando o pipeline existente.
-
-**B. Papel `Support`.** Ausente do `RolesSeeder`. Faltam as permissões de chat e as
-dos poderes decididos. E o vocabulário de status **não acomoda** cancelamento pelo
-Suporte: só há `canceled_by_client` e `canceled_by_admin`, falta `canceled_by_support`.
-
-### Menores
+**O maior furo é a ausência de teste no frontend.** Toda a UI foi verificada à mão no
+navegador, mas nada impede uma regressão silenciosa.
 
 1. `deliveries.scheduled_to` sem uso — agendamento nunca foi decidido.
 2. `tailwind.config.js` fora do padrão do prettier (2 erros de lint pré-existentes,
    commitados em `af4c837`).
 3. `websocket-api` tem 21 advisories de segurança em 6 pacotes, todos transitivos do
    skeleton do Hyperf e presos pelas constraints dele (`composer audit`).
-4. phpstan no nível 0. Subir exige `hyperf/phpstan-extension`: as 9 ocorrências acima
-   de 0 são magia de framework (relações Eloquent, `BASE_PATH`, um tipo do Swow que
-   nem está instalado), e silenciá-las com ignores faria a ferramenta mentir.
+4. O phpstan está preso ao 1.12 porque o `larastan/larastan` 2.x o pina; o 3.x pede
+   Laravel 11+. Subir de versão é um upgrade de framework, não de ferramenta.
 5. Nenhum teste no frontend nem no `websocket-api`.
 6. `attach` numa entrega já tomada responde 404 (o escopo filtra antes do validador).
    A tela trata como "não disponível"; virar 409 exigiria buscar fora do escopo.
@@ -657,3 +734,12 @@ Suporte: só há `canceled_by_client` e `canceled_by_admin`, falta `canceled_by_
   `setUp`, e `actingAsUser()` para trocar de identidade.
 - Erro de regra de negócio é `BusinessException` (vira 409 pelo `Handler`), não
   `return false`. `return false` fica para "não encontrei", que vira 404.
+- **Relação nova exige tipo de retorno** (`: BelongsTo`, `: HasMany`, …). É assim que o
+  larastan resolve a relação; sem ele, todo uso dela vira erro de análise. Atributo novo
+  que não seja coluna exige `@property`.
+- `match` sobre enum é **exaustivo, sem `default`**. Assim, acrescentar caso ao
+  `NotificationTitleEnum` sem a Strategy correspondente falha no phpstan em vez de
+  estourar em produção.
+- Precisa saber quem tem um poder? `UserRepository::findByPermission()`. Nunca
+  `findByRole()` com nome cravado — a não ser que o nome da role *seja* o dado, como no
+  filtro `GET /users?role=`.
